@@ -1,0 +1,3 @@
+Generic visualization GUI instead of anticipating what the user wants beforehand.
+LLM integration to convert pubmed queries to scopus.
+LLM integration to let the user enter an unformatted query and convert that to scopus.
