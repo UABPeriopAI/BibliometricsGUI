@@ -101,7 +101,7 @@ def convert_query_with_llm(query, prompt_type="pubmed"):
             f"Query:\n\n{query}\n\n"
             f"Output the result as a **strict and explicitly formatted Scopus query only**."
         )
-    else:
+    elif prompt_type == "generic":
         prompt = (
             f"Convert the following unformatted query into a **strict and valid Scopus query**. "
             f"Ensure that the query explicitly matches all provided conditions. Use the following Scopus field codes:\n"
@@ -122,6 +122,13 @@ def convert_query_with_llm(query, prompt_type="pubmed"):
             f"- If multiple search fields are present, infer the fields intelligently based on their structure.\n\n"
             f"Query:\n\n{query}\n\n"
             f"Output the result as a **strict and explicitly formatted Scopus query only**."
+        )
+    elif prompt_type == "crossref":
+        prompt = (
+            f"Convert the following DOI into a valid CrossRef query format. "
+            f"Ensure that the query is correctly formatted for CrossRef API calls. "
+            f"Query:\n\n{query}\n\n"
+            f"Output the result as a **strict and explicitly formatted CrossRef query only**."
         )
 
     payload = {
@@ -200,7 +207,7 @@ def fetch_scopus_data(query):
     try:
         search = ScopusSearch(query)
         if not search.results:
-            st.error("No results found for the query!")
+            st.error("No results found for the query, checking CrossRef")
             return pd.DataFrame()
         df = pd.DataFrame(search.results)
         if 'coverDate' in df.columns:
@@ -253,6 +260,7 @@ def fetch_crossref_data(doi):
     """
     try:
         clean_doi = doi.strip()  # Ensure proper formatting
+        clean_doi = clean_doi.rstrip('.,;!?')
         encoded_doi = quote(clean_doi)  # Properly encode DOI for URL
         url = f"https://api.crossref.org/works/{encoded_doi}"  # Build URL
         
@@ -262,9 +270,6 @@ def fetch_crossref_data(doi):
             "Accept": "application/json"
         }
 
-        # Log the URL for debugging
-        st.write(f"Querying CrossRef with URL: {url}")
-        st.write(f"Request Headers: {headers}")
         
         time.sleep(1)
         
@@ -272,9 +277,7 @@ def fetch_crossref_data(doi):
         response = requests.get(url, headers=headers)
         
         # Log the response status and text for debugging
-        st.write(f"Original DOI: {doi}, Cleaned DOI: {clean_doi}")
         st.write(f"CrossRef Response Status Code: {response.status_code}")
-        st.write(f"CrossRef Response Body: {response.text}")
         
         if response.status_code == 200:
             data = response.json()
@@ -294,42 +297,38 @@ def fetch_crossref_data(doi):
 
 
 def fetch_data_for_dois(dois):
-    """
-    Fetch publication data for DOIs from Scopus, and fallback to CrossRef if needed.
-    """
     publication_data = []
     for doi in dois:
         clean_doi = doi.strip()
         st.info(f"Processing DOI: {clean_doi}")
-
-        # Use LLM to convert the DOI into Scopus query format
+        
+        crossref_query = convert_query_with_llm(f'DOI("{clean_doi}")', prompt_type="crossref")
         converted_query = convert_query_with_llm(f'DOI("{clean_doi}")', prompt_type="generic")
 
         if converted_query:
             scopus_data = fetch_scopus_data(converted_query)
             if not scopus_data.empty:
-                publication_data.append(scopus_data.iloc[0])  # Assuming single record per DOI
-                continue  # Skip fallback for successful Scopus results
-
-        # Fall back to CrossRef if no Scopus results
-        crossref_data = fetch_crossref_data(clean_doi)
-        if crossref_data:
-            # Extract and process fields safely
-            publication_data.append({
-                "journal_issn": crossref_data.get("ISSN", [None])[0],  # First ISSN if list exists
-                "publication_date": crossref_data.get("issued", {}).get("date-parts", [[None]])[0][0] if crossref_data.get("issued") else None,  # Extract year
-                "journal_name": crossref_data.get("container-title", [None])[0] if "container-title" in crossref_data else None,  # First journal name
-                "title": crossref_data.get("title", [None])[0] if "title" in crossref_data else None,  # First title
-                "doi": crossref_data.get("DOI", None),  # DOI
-            })
-
-        else:
-            st.warning(f"No results found for DOI: {clean_doi}")
-
+                publication_data.append(scopus_data.iloc[0].to_dict())
+                continue
+        
+        if crossref_query:
+            crossref_data = fetch_crossref_data(clean_doi)
+            if crossref_data:
+                publication_data.append({
+                    "journal_issn": crossref_data.get("ISSN", [None])[0] if isinstance(crossref_data.get("ISSN"), list) and crossref_data.get("ISSN") else None,
+                    "publication_date": crossref_data.get("issued", {}).get("date-parts", [[None]])[0][0] if crossref_data.get("issued") and crossref_data.get("issued").get("date-parts") else None,
+                    "journal_name": crossref_data.get("container-title", [None])[0] if isinstance(crossref_data.get("container-title"), list) and crossref_data.get("container-title") else None,
+                    "title": crossref_data.get("title", [None])[0] if isinstance(crossref_data.get("title"), list) and crossref_data.get("title") else None,
+                    "doi": crossref_data.get("DOI", None),  # DOI
+                })
+            else:
+                st.warning(f"No results found for DOI: {clean_doi}")
+    
     if publication_data:
         return pd.DataFrame(publication_data)
     else:
-        return pd.DataFrame()
+        st.warning("No publication data found for the provided DOIs.")
+        return pd.DataFrame(columns=["journal_issn", "publication_date", "journal_name", "title", "doi"])
 
 
 # =============================================================================
@@ -417,6 +416,7 @@ elif data_source == "Scopus Query":
         height=100,
         key="direct_query"
     )
+    
     
     # Button to execute the query
     if st.sidebar.button("Execute Query", key="execute_scopus"):
