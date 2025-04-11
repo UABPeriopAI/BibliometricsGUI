@@ -6,8 +6,6 @@ import pygwalker as pyg
 import networkx as nx
 import matplotlib.pyplot as plt
 import plotly.express as px
-import plotly.graph_objects as go
-import seaborn as sns
 from itertools import combinations
 from pathlib import Path
 import datetime
@@ -18,7 +16,7 @@ import requests
 import json
 import time
 from urllib.parse import quote
-import requests  # needed for LLM API calls
+import requests
 from pybliometrics.scopus import SerialTitle, ScopusSearch, init, create_config
 
 # =============================================================================
@@ -52,16 +50,13 @@ def convert_query_with_llm(query, prompt_type="pubmed"):
         Returns a reformatted string with consistent PUBYEAR conditions.
         """
         import re
-        # Match date ranges like '2020-2025'
         date_range_pattern = r"(\d{4})-(\d{4})"
         match = re.search(date_range_pattern, input_query)
         if match:
             start_year = int(match.group(1))
             end_year = int(match.group(2))
-            # Adjust lower and upper bounds for strict matching
             lower_bound = start_year - 1
             upper_bound = end_year + 1
-            # Replace the range with the PUBYEAR format
             date_query = f"PUBYEAR > {lower_bound} AND PUBYEAR < {upper_bound}"
             input_query = re.sub(date_range_pattern, date_query, input_query)
         return input_query
@@ -76,7 +71,6 @@ def convert_query_with_llm(query, prompt_type="pubmed"):
         "Content-Type": "application/json"
     }
 
-    # Preprocess the query to handle date ranges
     query = preprocess_date_range(query)
 
     if prompt_type == "pubmed":
@@ -177,7 +171,7 @@ def get_snip(journal_issn, pub_year):
             snip_cache[key] = np.nan
             return np.nan
     except Exception as e:
-        st.error(f"Error retrieving SNIP for ISSN {journal_issn}: {e}")
+        #st.error(f"Error retrieving SNIP for ISSN {journal_issn}: {e}")
         snip_cache[key] = np.nan
         return np.nan
 
@@ -207,7 +201,6 @@ def fetch_scopus_data(query):
     try:
         search = ScopusSearch(query)
         if not search.results:
-            st.error("No results found for the query, checking CrossRef")
             return pd.DataFrame()
         df = pd.DataFrame(search.results)
         if 'coverDate' in df.columns:
@@ -218,7 +211,7 @@ def fetch_scopus_data(query):
             df['journal_issn'] = df['issn']
         return df
     except Exception as e:
-        st.error("Error executing Scopus query: " + str(e))
+        st.error(f"Error executing Scopus query: {query}. {str(e)}")
         return pd.DataFrame()
 
 @st.cache_data
@@ -241,43 +234,54 @@ def enrich_with_snip(df):
 @st.cache_data
 def extract_dois_from_docx(file):
     """
-    Extracts DOI numbers from a .docx file.
+    Extracts DOI numbers from a .docx file, removing "doi: " prefix and trailing periods.
     """
     try:
         document = Document(BytesIO(file.read()))
-        text = "\n".join([para.text for para in document.paragraphs])
-        # Regular expression to match DOI numbers
-        doi_pattern = r"10.\d{4,9}/[-._;()/:A-Za-z0-9]+"
-        dois = re.findall(doi_pattern, text)
-        return list(set(dois))  # Return unique DOIs
+        text = " ".join([para.text.strip() for para in document.paragraphs])
+        doi_pattern = r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+"
+        raw_dois = re.findall(doi_pattern, text)
+        cleaned_dois = [doi.rstrip(".") for doi in raw_dois]
+
+        return list(set(cleaned_dois))  # Return unique DOIs
     except Exception as e:
-        st.error(f"Error reading .docx file: {e}")
+        print(f"Error reading .docx file: {e}")
         return []
 
+def is_crossref_available():
+    """
+    Check if the CrossRef API is functioning.
+    """
+    try:
+        test_url = "https://api.crossref.org/works/"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "Accept": "application/json"
+        }
+        response = requests.get(test_url, headers=headers)
+        return response.status_code == 200
+    except Exception:
+        return False
+
+@st.cache_data
 def fetch_crossref_data(doi):
     """
     Query CrossRef for publication data using DOI.
     """
+    if not is_crossref_available():
+        st.warning("CrossRef API is not responding. Some data may be missing.")
+        return None
+    
     try:
-        clean_doi = doi.strip()  # Ensure proper formatting
-        clean_doi = clean_doi.rstrip('.,;!?')
-        encoded_doi = quote(clean_doi)  # Properly encode DOI for URL
-        url = f"https://api.crossref.org/works/{encoded_doi}"  # Build URL
-        
-        # Define headers for the API request
+        clean_doi = doi.strip().rstrip('.,;!?')
+        encoded_doi = quote(clean_doi)
+        url = f"https://api.crossref.org/works/{encoded_doi}"
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
             "Accept": "application/json"
         }
 
-        
-        time.sleep(1)
-        
-        # Perform the GET request with headers
         response = requests.get(url, headers=headers)
-        
-        # Log the response status and text for debugging
-        st.write(f"CrossRef Response Status Code: {response.status_code}")
         
         if response.status_code == 200:
             data = response.json()
@@ -286,65 +290,100 @@ def fetch_crossref_data(doi):
             else:
                 st.warning("CrossRef response does not contain 'message' key.")
         elif response.status_code == 404:
-            st.warning(f"CrossRef returned 404 for DOI: {clean_doi}")
+            pass
         else:
             st.error(f"CrossRef API error {response.status_code}: {response.text}")
     except Exception as e:
         st.error(f"Error querying CrossRef for DOI {clean_doi}: {e}")
     return None
 
-
-
-
+@st.cache_data
 def fetch_data_for_dois(dois):
+    total_dois = len(dois)
+    progress_bar = st.progress(0)
     publication_data = []
-    for doi in dois:
-        clean_doi = doi.strip()
-        st.info(f"Processing DOI: {clean_doi}")
-        
-        crossref_query = convert_query_with_llm(f'DOI("{clean_doi}")', prompt_type="crossref")
-        converted_query = convert_query_with_llm(f'DOI("{clean_doi}")', prompt_type="generic")
 
+    for index, doi in enumerate(dois, start=1):
+        clean_doi = doi.strip()
+        progress_bar.progress(index / total_dois)
+        row_data = {}
+        converted_query = convert_query_with_llm(f'DOI("{clean_doi}")', prompt_type="generic")
         if converted_query:
             scopus_data = fetch_scopus_data(converted_query)
             if not scopus_data.empty:
-                publication_data.append(scopus_data.iloc[0].to_dict())
-                continue
+                row_data = scopus_data.iloc[0].to_dict()
         
+        crossref_query = convert_query_with_llm(f'DOI("{clean_doi}")', prompt_type="crossref")
         if crossref_query:
             crossref_data = fetch_crossref_data(clean_doi)
             if crossref_data:
-                publication_data.append({
-                    "journal_issn": crossref_data.get("ISSN", [None])[0] if isinstance(crossref_data.get("ISSN"), list) and crossref_data.get("ISSN") else None,
-                    "publication_date": crossref_data.get("issued", {}).get("date-parts", [[None]])[0][0] if crossref_data.get("issued") and crossref_data.get("issued").get("date-parts") else None,
-                    "journal_name": crossref_data.get("container-title", [None])[0] if isinstance(crossref_data.get("container-title"), list) and crossref_data.get("container-title") else None,
-                    "title": crossref_data.get("title", [None])[0] if isinstance(crossref_data.get("title"), list) and crossref_data.get("title") else None,
-                    "doi": crossref_data.get("DOI", None),  # DOI
+                row_data.update({
+                    "journal_issn": row_data.get("journal_issn") or (crossref_data.get("ISSN", [None])[0] if isinstance(crossref_data.get("ISSN"), list) and crossref_data.get("ISSN") else None),
+                    "publication_date": row_data.get("publication_date") or (crossref_data.get("issued", {}).get("date-parts", [[None]])[0][0] if crossref_data.get("issued") and crossref_data.get("issued").get("date-parts") else None),
+                    "journal_name": row_data.get("journal_name") or (crossref_data.get("container-title", [None])[0] if isinstance(crossref_data.get("container-title"), list) and crossref_data.get("container-title") else None),
+                    "title": row_data.get("title") or (crossref_data.get("title", [None])[0] if isinstance(crossref_data.get("title"), list) and crossref_data.get("title") else None),
+                    "doi": row_data.get("doi") or crossref_data.get("DOI", None),
+                    "author_names": row_data.get("author_names") or ", ".join([author.get("given", "") + " " + author.get("family", "") for author in crossref_data.get("author", [])]) if "author" in crossref_data else None,
+                    "citation_count": row_data.get("citation_count") or crossref_data.get("is-referenced-by-count", None),
+                    "publication_date": row_data.get("date_published") or crossref_data.get("created", {}).get("date-time", None),
+                    "cited_by": crossref_data.get("is-referenced-by-count", None)  # Ensure the cited_by column is populated
                 })
-            else:
-                st.warning(f"No results found for DOI: {clean_doi}")
-    
+
+        if row_data:
+            publication_data.append(row_data)
+        else:
+            st.warning(f"No results found for DOI: {clean_doi}")
+
+    progress_bar.empty()
+
     if publication_data:
         return pd.DataFrame(publication_data)
     else:
         st.warning("No publication data found for the provided DOIs.")
-        return pd.DataFrame(columns=["journal_issn", "publication_date", "journal_name", "title", "doi"])
-
+        return pd.DataFrame(columns=["journal_issn", "publication_date", "journal_name", "title", "doi", "author_names", "citation_count", "date_published"])
 
 # =============================================================================
 # Data Processing Functions
 # =============================================================================
+# Build the co-author network
+def normalize_name(name):
+    """
+    Normalize names to 'Firstname Lastname' format.
+    """
+    name = name.strip()
+    if ',' in name:  # Format: "Lastname, Firstname"
+        last, first = map(str.strip, name.split(',', maxsplit=1))
+        return f"{first} {last}"
+    return name  # Assume format is already "Firstname Lastname"
+
 def build_coauthor_network(df):
     G = nx.Graph()
+
     for authors in df['author_names']:
-        # Split author names (assumed separated by ';') and strip whitespace
-        author_list = [author.strip() for author in authors.split(';')]
-        for pair in combinations(author_list, 2):
-            if G.has_edge(*pair):
-                G[pair[0]][pair[1]]['weight'] += 1
+        if authors:  # Ensure authors is not empty or invalid
+            author_list = []
+            
+            # Handle semicolon-separated names first
+            if ';' in authors:
+                raw_authors = authors.split(';')  # Split by semicolon
             else:
-                G.add_edge(*pair, weight=1)
+                raw_authors = authors.split(',')  # Split by comma if no semicolons
+            
+            # Normalize all names to consistent format
+            for raw_name in raw_authors:
+                normalized_name = normalize_name(raw_name)
+                if normalized_name:  # Ensure the name is valid
+                    author_list.append(normalized_name)
+            
+            # Create edges for all combinations of authors
+            for pair in combinations(author_list, 2):
+                if G.has_edge(*pair):
+                    G[pair[0]][pair[1]]['weight'] += 1
+                else:
+                    G.add_edge(*pair, weight=1)
+    
     return G
+
 
 # =============================================================================
 # Streamlit App Layout and Main Logic
@@ -352,9 +391,9 @@ def build_coauthor_network(df):
 st.title("Publication Metrics Dashboard")
 st.markdown("""
 This app allows you to explore publication metrics for the Division of Molecular and Translational BioMedicine.
-You can either upload a spreadsheet (e.g., a publication report) **or** enter and execute a Scopus query.
+You can either upload a spreadsheet (e.g., a publication report), a word document with doi list, **or** enter and execute a Scopus query.
 The app aggregates publications over time, enriches them with SNIP 
-(Source-Normalized Impact per Paper) values via the Elsevier API, and builds a co-author network.
+(Source-Normalized Impact per Paper) values, and allows for building plots to analyze publication stats.
 """)
 
 # ------------------------------------------------------------------------------
@@ -365,19 +404,16 @@ data_source = st.sidebar.radio("Select Data Source", ["Scopus Query", "Upload Sp
 df = pd.DataFrame()
 
 if data_source == "Upload Spreadsheet":
-    # File upload functionality
     uploaded_file = st.sidebar.file_uploader("Upload Publications File (CSV, Excel, or DOCX)", type=["csv", "xls", "xlsx", "docx"])
     
     if uploaded_file is not None:
         filename = uploaded_file.name.lower()
         
         if filename.endswith(('.csv', '.xls', '.xlsx')):
-            # Process CSV or Excel files
             df = load_data(uploaded_file)
             df = process_data(df)
         
         elif filename.endswith('.docx'):
-            # Process DOCX files and extract DOIs
             dois = extract_dois_from_docx(uploaded_file)
             if dois:
                 df = fetch_data_for_dois(dois)
@@ -387,40 +423,31 @@ if data_source == "Upload Spreadsheet":
                 st.error("No DOIs found in the uploaded DOCX file!")
 
 elif data_source == "Scopus Query":
-    # Scopus Query functionality
     st.sidebar.subheader("Enter Search Parameters")
     
-    # LLM Query Conversion expander
     with st.sidebar.expander("LLM Query Conversion", expanded=False):
         conversion_method = st.selectbox(
             "Select Conversion Method",
             ["PubMed to Scopus Query", "Unformatted to Scopus Query"]
         )
-        input_query = st.text_area("Enter your query", height=100, key="input_query")  # Input field for LLM conversion
+        input_query = st.text_area("Enter your query", height=100, key="input_query")
         if st.button("Convert Query", key="llm_query_convert"):
             prompt_type = "pubmed" if conversion_method == "PubMed to Scopus Query" else "generic"
-            
-            # Call function to convert the query
             converted_query = convert_query_with_llm(input_query, prompt_type=prompt_type)
-            
-            # Populate the "Enter Scopus Query Directly" text area with the converted query
+
             if converted_query:
                 st.session_state.scopus_query = converted_query
             else:
                 st.error("Conversion failed. Please check your input and API settings.")
 
-    # Direct Scopus Query input field
     scopus_query = st.sidebar.text_area(
         "Enter Scopus Query Directly",
-        value=st.session_state.get("scopus_query", ""),  # Populate with converted query if available
+        value=st.session_state.get("scopus_query", ""),
         height=100,
         key="direct_query"
     )
     
-    
-    # Button to execute the query
     if st.sidebar.button("Execute Query", key="execute_scopus"):
-        # Use the query from the text area (either entered manually or populated by LLM conversion)
         with st.spinner("Executing Scopus query..."):
             df = fetch_scopus_data(scopus_query)  # Fetch data
             if not df.empty:
@@ -436,70 +463,55 @@ if "scopus_df" in st.session_state:
 # ------------------------------------------------------------------------------
 # Main App: Display, Enrichment, and Visualization
 # ------------------------------------------------------------------------------
-# Get the current year
 current_year = datetime.datetime.now().year
 
-# Filter the dataset for the last 5 years
 if not df.empty:
     with st.spinner("Retrieving SNIP values from Elsevier..."):
         df = enrich_with_snip(df)
 
-    # Reorder columns so key ones appear first
     desired_column_order = ["SNIP", "title", "Year", "Month", "author_names"]
     other_columns = [col for col in df.columns if col not in desired_column_order]
     final_column_order = desired_column_order + other_columns
     df = df[final_column_order]
-    
-    # Combine Year and Month into a new column
     df["MonthYear"] = df["Month"].astype(str) + "-" + df["Year"].astype(str)
-    
-    # Convert 'MonthYear' to datetime format
-    df["MonthYear"] = pd.to_datetime(df["MonthYear"], format='%m-%Y')
-    
-    # Ensure 'Year' values are valid (not exceeding available data)
+    df["MonthYear"] = df["MonthYear"].str.replace(r"\.0", "", regex=True)
+    df["MonthYear"] = pd.to_datetime(df["MonthYear"], format='%m-%Y', errors='coerce')
+    df["Year"] = pd.to_numeric(df["Year"], errors='coerce')
     df['Year'] = df['Year'].astype('category')
     
-    # Filter data for the last 5 years
-    df_last_5_years = df[df['Year'].astype(int) >= (current_year - 4)]
+    current_year = pd.Timestamp.now().year
 
-    # Sort by SNIP values and display
+    df_last_5_years = df[df['Year'].astype(float) >= (current_year - 4)]  # Use float for comparison
+
     st.subheader("Publications with Impact Factor (SNIP)")
     df = df.sort_values(by="SNIP", ascending=False)
     st.write(df)
-    
-    # Launch PyGWalker (if button is clicked)
+
+    st.write("Click below to view all data via PyGWalker. ")
     if st.button("Click Here for Drag and Drop Interactive Data Viewer"):
         pyg.walk(df[["title", "Year", "MonthYear", "SNIP", "citedby_count"]], theme="dark")
 
     # Line Graph (last 5 years)
     monthly_counts_last_5_years, _ = aggregate_counts(df_last_5_years)
     grouped_counts_last_5_years = monthly_counts_last_5_years
-    
-    # Fill in missing months with zero counts
     grouped_counts_last_5_years['Year'] = grouped_counts_last_5_years['Year'].astype(int)
     grouped_counts_last_5_years['Month'] = grouped_counts_last_5_years['Month'].astype(int)
-    
-    # Create a complete date range for the last 5 years
 
-    # Use datetime.datetime instead of datetime
     min_date = datetime.datetime(grouped_counts_last_5_years['Year'].min(), grouped_counts_last_5_years['Month'].min(), 1)
     max_date = datetime.datetime(grouped_counts_last_5_years['Year'].max(), grouped_counts_last_5_years['Month'].max(), 1)
 
     complete_date_range_last_5_years = pd.date_range(start=min_date, end=max_date, freq='MS')
     
-    # Convert the date range to Year-Month format
     date_range_df_last_5_years = pd.DataFrame({
         'YearMonth': complete_date_range_last_5_years.strftime('%Y-%m'),
         'Year': complete_date_range_last_5_years.year,
         'Month': complete_date_range_last_5_years.month
     })
     
-    # Merge with the grouped_counts to include missing months and fill with zeros
     grouped_counts_last_5_years = pd.merge(date_range_df_last_5_years, grouped_counts_last_5_years, how='left', on=['Year', 'Month'])
     grouped_counts_last_5_years['Count'] = grouped_counts_last_5_years['Count'].fillna(0)
     grouped_counts_last_5_years['YearMonth'] = grouped_counts_last_5_years['YearMonth'].astype(str)
     
-    # Filter the grouped data to only include the last 5 years
     grouped_counts_last_5_years = grouped_counts_last_5_years[
         grouped_counts_last_5_years['Year'] >= (current_year - 4)
     ]
@@ -516,7 +528,6 @@ if not df.empty:
     fig.update_yaxes(rangemode="tozero")
     fig.update_traces(line=dict(color="darkgreen"), marker=dict(color="darkgreen"))
     
-    # Adjust x-axis to display only the filtered years
     fig.update_xaxes(
         tickmode='array',
         tickvals=grouped_counts_last_5_years['YearMonth'].iloc[::12],  # Label only filtered years
@@ -526,7 +537,7 @@ if not df.empty:
         title=dict(
             text="Monthly Publication Trend (Last 5 Years)",
             font=dict(color="black", size=18),
-            x=0.36
+            x=0.3
         ),
         plot_bgcolor="white",
         paper_bgcolor="white",
@@ -550,7 +561,7 @@ if not df.empty:
         title=dict(
             text="SNIP Distribution by Year (Last 5 Years)",
             font=dict(color="black", size=18),
-            x=0.36
+            x=0.3
         ),
         plot_bgcolor="white",
         paper_bgcolor="white",
@@ -562,33 +573,44 @@ if not df.empty:
     )
     st.plotly_chart(fig, use_container_width=True, key="violin_plot_last_5_years")
 
-    # Co-Author Network Visualization (last 5 years)
+    def filter_network(graph, min_collaborations=1):
+        filtered_graph = nx.Graph()
+        for u, v, data in graph.edges(data=True):
+            if data['weight'] >= min_collaborations:
+                filtered_graph.add_node(u)
+                filtered_graph.add_node(v)
+                filtered_graph.add_edge(u, v, weight=data['weight'])
+        return filtered_graph
+    
+    # Coauthor Network Visualisation
     if "author_names" in df_last_5_years.columns:
         st.write("### Co-Author Network Visualization (Last 5 Years)")
+        
+        # Build the co-author network
         coauthor_network = build_coauthor_network(df_last_5_years)
-    
-        def filter_network(graph, min_collaborations=1):
-            filtered_graph = nx.Graph()
-            for u, v, data in graph.edges(data=True):
-                if data['weight'] >= min_collaborations:
-                    if not filtered_graph.has_node(u):
-                        filtered_graph.add_node(u)
-                    if not filtered_graph.has_node(v):
-                        filtered_graph.add_node(v)
-                    filtered_graph.add_edge(u, v, weight=data['weight'])
-            return filtered_graph
-    
+        
+        # Filter by minimum collaborations dynamically using slider
         min_collaborations = st.slider("Minimum Collaborations to Display", 1, 10, 4)
         filtered_coauthor_network = filter_network(coauthor_network, min_collaborations=min_collaborations)
         
+        # Visualize the graph
         fig, ax = plt.subplots(figsize=(12, 10))
-        pos = nx.spring_layout(filtered_coauthor_network, seed=42, k=0.7)
-        node_sizes = [100 + (degree * 10) for _, degree in filtered_coauthor_network.degree()]
-        nx.draw_networkx_nodes(filtered_coauthor_network, pos, node_size=node_sizes, node_color="darkgreen")
-        edge_widths = [filtered_coauthor_network[u][v]['weight']/2 for u, v in filtered_coauthor_network.edges()]
-        nx.draw_networkx_edges(filtered_coauthor_network, pos, width=edge_widths, alpha=0.7, edge_color="gray")
+        pos = nx.spring_layout(filtered_coauthor_network, seed=42, k=1.2, iterations=100)  # Adjusted k and iterations
+        
+        # Draw nodes with standard size
+        nx.draw_networkx_nodes(
+            filtered_coauthor_network, pos, node_size=200, node_color="green", alpha=0.8
+        )
+        
+        # Draw edges with standard width
+        nx.draw_networkx_edges(
+            filtered_coauthor_network, pos, width=1.5, alpha=0.7, edge_color="gray"
+        )
+        
+        # Add node labels
         nx.draw_networkx_labels(filtered_coauthor_network, pos, font_size=10, font_color="black")
-        plt.title("Filtered Co-Author Network (Last 5 Years)", fontsize=14)
+        
+        plt.title("Co-Author Network (Last 5 Years)", fontsize=14)
         plt.axis("off")
         st.pyplot(fig)
 
